@@ -52,6 +52,22 @@ const escapeHtml = (str = "") =>
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 
+const createTransporter = () => {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT) || 465,
+    secure: process.env.SMTP_SECURE === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS.replace(/\s+/g, ""),
+    },
+  });
+};
+
 app.get("/", (req, res) => {
   res.status(200).json({ ok: true, message: "API Portfolio Abed opérationnelle" });
 });
@@ -75,22 +91,13 @@ app.post("/api/contact", async (req, res) => {
       });
     }
 
-    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    const transporter = createTransporter();
+    if (!transporter) {
       return res.status(500).json({
         success: false,
         message: "Configuration SMTP manquante sur le serveur.",
       });
     }
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || "smtp.gmail.com",
-      port: Number(process.env.SMTP_PORT) || 465,
-      secure: process.env.SMTP_SECURE === "true",
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS.replace(/\s+/g, ""),
-      },
-    });
 
     const serviceLabel = SERVICE_LABELS[service] || service;
 
@@ -129,6 +136,130 @@ app.post("/api/contact", async (req, res) => {
       success: false,
       message: "Erreur serveur lors de l'envoi du message.",
     });
+  }
+});
+
+app.post("/api/visit", async (req, res) => {
+  try {
+    const {
+      page = "Non renseignée",
+      referrer = "Accès direct",
+      language = "Inconnue",
+      platform = "Inconnu",
+      screen = "Inconnu",
+      timezone = "Inconnu",
+      userAgent = req.headers["user-agent"] || "Inconnu",
+    } = req.body || {};
+
+    // 1. Ignorer les bots / crawlers
+    if (/bot|crawl|spider|slurp|lighthouse|headless|facebookexternalhit/i.test(userAgent)) {
+      return res.status(200).json({ success: true, ignored: "bot" });
+    }
+
+    const transporter = createTransporter();
+    if (!transporter) {
+      return res.status(500).json({
+        success: false,
+        message: "Configuration SMTP manquante sur le serveur.",
+      });
+    }
+
+    // 2. Récupérer l'IP réelle du visiteur
+    const forwarded = req.headers["x-forwarded-for"];
+    let ip = forwarded
+      ? forwarded.split(",")[0].trim()
+      : req.socket?.remoteAddress || "Inconnue";
+
+    if (ip.startsWith("::ffff:")) {
+      ip = ip.replace("::ffff:", "");
+    }
+
+    const isLocalIp = ip === "127.0.0.1" || ip === "::1" || ip === "Inconnue";
+
+    // 3. Infos géographiques (fallback sur les headers Vercel si présents)
+    let geo = {
+      country: req.headers["x-vercel-ip-country"] || "Inconnu",
+      region: req.headers["x-vercel-ip-country-region"] || "Inconnue",
+      city: req.headers["x-vercel-ip-city"]
+        ? decodeURIComponent(req.headers["x-vercel-ip-city"])
+        : "Inconnue",
+      isp: "Inconnu",
+      org: "Inconnu",
+      flag: "",
+    };
+
+    if (!isLocalIp) {
+      try {
+        const geoRes = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        const geoData = await geoRes.json();
+
+        if (geoData && geoData.success) {
+          geo = {
+            country: geoData.country || geo.country,
+            region: geoData.region || geo.region,
+            city: geoData.city || geo.city,
+            isp: geoData.connection?.isp || "Inconnu",
+            org: geoData.connection?.org || "Inconnu",
+            flag: geoData.flag?.emoji || "",
+          };
+        }
+      } catch (geoErr) {
+        console.warn("Erreur lookup GeoIP :", geoErr.message);
+      }
+    } else {
+      geo.country = "Localhost (Test local)";
+    }
+
+    const dateVisit = new Date().toLocaleString("fr-FR", {
+      timeZone: "Africa/Porto-Novo",
+      dateStyle: "full",
+      timeStyle: "medium",
+    });
+
+    // 4. Envoi de l'email avec tes variables SMTP_USER et ADMIN_EMAIL
+    await transporter.sendMail({
+      from: `"Portfolio Abed" <${process.env.SMTP_USER}>`,
+      to: process.env.ADMIN_EMAIL || process.env.SMTP_USER,
+      subject: `👀 Nouvelle visite sur ton portfolio (${geo.country} ${geo.flag})`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #eae5dc; border-radius: 12px; overflow: hidden;">
+          <div style="background: #ce3c13; color: #fff; padding: 16px 24px;">
+            <h2 style="margin: 0; font-size: 18px;">Nouvelle visite détectée</h2>
+          </div>
+          <div style="padding: 20px 24px; color: #101010; background: #ffffff; line-height: 1.6;">
+            <p><strong>Date (Bénin) :</strong> ${escapeHtml(dateVisit)}</p>
+            <hr style="border: none; border-top: 1px solid #eee; margin: 14px 0;" />
+            <h3 style="margin: 0 0 10px; color: #ce3c13;">Réseau & Localisation</h3>
+            <ul style="padding-left: 18px; margin: 0;">
+              <li><strong>Adresse IP :</strong> ${escapeHtml(ip)}</li>
+              <li><strong>Pays :</strong> ${escapeHtml(geo.country)} ${escapeHtml(geo.flag)}</li>
+              <li><strong>Région :</strong> ${escapeHtml(geo.region)}</li>
+              <li><strong>Ville :</strong> ${escapeHtml(geo.city)}</li>
+              <li><strong>FAI / Opérateur :</strong> ${escapeHtml(geo.isp)}</li>
+              <li><strong>Organisation :</strong> ${escapeHtml(geo.org)}</li>
+            </ul>
+            <hr style="border: none; border-top: 1px solid #eee; margin: 14px 0;" />
+            <h3 style="margin: 0 0 10px; color: #ce3c13;">Appareil & Navigation</h3>
+            <ul style="padding-left: 18px; margin: 0;">
+              <li><strong>Page visitée :</strong> ${escapeHtml(page)}</li>
+              <li><strong>Provenance (Referrer) :</strong> ${escapeHtml(referrer)}</li>
+              <li><strong>Langue :</strong> ${escapeHtml(language)}</li>
+              <li><strong>Système :</strong> ${escapeHtml(platform)}</li>
+              <li><strong>Résolution écran :</strong> ${escapeHtml(screen)}</li>
+              <li><strong>Fuseau horaire :</strong> ${escapeHtml(timezone)}</li>
+              <li><strong>User-Agent :</strong> <small>${escapeHtml(userAgent)}</small></li>
+            </ul>
+          </div>
+        </div>
+      `,
+    });
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error("Erreur /api/visit :", error);
+    return res.status(500).json({ success: false });
   }
 });
 
